@@ -1,0 +1,33 @@
+How Redis Cache is Used
+
+Example:
+
+from django.core.cache import cache
+
+cache.set("hello", "world", timeout=60)
+
+value = cache.get("hello")
+
+cache.delete("hello")     # remove a single key
+cache.clear()             # ⚠️ flushes the whole cache (db index 1, see REDIS_URL)
+
+
+Inspect Redis directly (dev):
+
+$ docker compose -f docker-compose.dev.yml exec redis redis-cli
+    KEYS *
+    TTL :1:hello        # django-redis prefixes keys with the cache db index
+    GET :1:hello
+    FLUSHDB              # ⚠️ same effect as cache.clear()
+
+
+Notes:
+- REDIS_URL points at db index 1 (see docker/django/settings.overwrite.py),
+  so `redis-cli -n 1` also works instead of the `:1:` key prefix above.
+- cache.set(..., timeout=None) means "never expire" — the default backend
+  timeout otherwise is 300s if you omit the timeout argument entirely.
+
+
+docs/guide/overview.txt:    Check connection to Redis and DB from shell.
+........................................................................
+

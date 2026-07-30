@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1.6
+
+# =========================
+# Builder stage
+# =========================
+FROM python:3.13-slim AS builder
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /install
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements/base.txt .
+COPY requirements/prod.txt .
+
+RUN pip install --upgrade pip
+
+RUN pip install --prefix=/install/deps -r prod.txt
+
+# =========================
+# Runtime stage
+# =========================
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# COPY --from=builder /install/deps /usr/local
+COPY --from=builder /install/deps /opt/deps
+ENV PYTHONPATH=/opt/deps/lib/python3.13/site-packages
+ENV PATH="/opt/deps/bin:$PATH"
+
+RUN useradd -m djangouser
+
+COPY app /app
+
+# Pre-create staticfiles owned by djangouser: static_volume mounts here
+# empty on first run, and Docker seeds a new named volume from whatever
+# already exists at the mount point in the image — so this ownership is
+# what collectstatic (running as djangouser below) actually inherits.
+RUN mkdir -p /app/staticfiles && chown -R djangouser:djangouser /app
+
+USER djangouser
+
+EXPOSE 8000
+
+# Healthcheck: pings the gunicorn worker via Python's stdlib
+# (the slim image has no curl/wget by default). Targets /admin/login/, not
+# /, since this project's urls.py only registers admin/ — GET / is a
+# guaranteed 404, which urlopen treats as a failure.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/admin/login/', timeout=3)" || exit 1
+
+# Default CMD (used only when the image is run directly, e.g. `docker run ...`).
+# docker-compose.prod.yml overrides this with `migrate + collectstatic + gunicorn`.
+CMD ["gunicorn", "config.wsgi:application", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "4", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-"]

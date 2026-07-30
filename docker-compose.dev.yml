@@ -1,0 +1,45 @@
+# version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: ./docker/django/Dockerfile.dev
+    container_name: django_api_dev
+    image: adved85/django-api-dev
+    command: python manage.py runserver 0.0.0.0:8000
+    volumes:
+      - ./app:/app
+    ports:
+      - "8008:8000"
+    env_file:
+      # - .env
+      - .env.dev
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:17
+    # container_name: postgres_dev
+    container_name: django_api_postgres_dev
+    restart: always
+    environment:
+      POSTGRES_DB: django_db
+      POSTGRES_USER: django_user
+      POSTGRES_PASSWORD: django_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:8-alpine
+    # container_name: redis_dev
+    container_name: django_api_redis_dev
+    restart: always
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_dev_data:

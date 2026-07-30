@@ -1,0 +1,11 @@
+# syntax=docker/dockerfile:1.6
+FROM caddy:2-alpine
+
+COPY docker/caddy/Caddyfile /etc/caddy/Caddyfile
+
+# Targets /admin/login/, not /: this project's urls.py only registers
+# admin/, so GET / is a guaranteed 404, which wget treats as a failure.
+# Uses 127.0.0.1, not localhost: alpine-based images often resolve
+# "localhost" to ::1 first, and IPv4-only listeners then refuse it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- http://127.0.0.1/admin/login/ || exit 1

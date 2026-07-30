@@ -1,0 +1,134 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/django/Dockerfile.prod
+    container_name: django_api_prod
+    image: adved85/django-api-prod
+    restart: always
+    command: >
+      sh -c "
+      python manage.py migrate --noinput &&
+      python manage.py collectstatic --noinput &&
+      gunicorn config.wsgi:application --bind 0.0.0.0:8000 --workers 4 --access-logfile - --error-logfile -
+      "
+    env_file:
+      - .env.prod
+    # No "ports:" here on purpose — gunicorn is reachable only from other
+    # containers on the compose network (via nginx below), never directly
+    # from the host. nginx is the only service that publishes a host port.
+    volumes:
+      # Persist collected static files between container rebuilds
+      - static_volume:/app/staticfiles
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Hits /admin/login/, not /: this project's urls.py only registers
+      # admin/, so GET / is a guaranteed 404 (urlopen raises on any 4xx/5xx,
+      # so that target could never pass). /admin/login/ always exists as
+      # long as django.contrib.admin stays installed.
+      #
+      # No "|| exit 1" needed: urlopen() raises on failure, which already
+      # makes `python -c` exit non-zero. (A previous version appended
+      # "|| exit 1" *inside* the Python string, which is a SyntaxError —
+      # that made this healthcheck permanently fail.)
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/admin/login/', timeout=3)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # Reverse proxy + static file server in front of gunicorn. Default choice:
+  # nginx — the more widely used, more configurable option, and the safer
+  # default for a reference project (most developers already know it, works
+  # the same everywhere). See docker/nginx/nginx.conf for the config, and
+  # docs/guide/BOOTSTRAP.md for the nginx-vs-Caddy tradeoffs and how to
+  # switch to the Caddy alternative commented out below.
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile.prod
+    container_name: django_api_nginx_prod
+    image: adved85/django-api-nginx-prod
+    restart: always
+    ports:
+      - "80:80"
+      # - "443:443"   # uncomment once you mount real TLS certs — nginx does
+                       # not obtain/renew certificates on its own, see
+                       # docker/nginx/nginx.conf
+    volumes:
+      - static_volume:/app/staticfiles:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------
+  # Alternative: Caddy instead of nginx.
+  # Simpler config, and it obtains + auto-renews Let's Encrypt certificates
+  # on its own (no certbot, no cron) once you point a real domain at :80/:443.
+  # Weaker default only because it's less ubiquitous than nginx — plenty
+  # powerful enough for this stack.
+  #
+  # To switch: comment out the whole `nginx:` service above, uncomment this
+  # block, then `docker compose -f docker-compose.prod.yml up --build -d`.
+  # ---------------------------------------------------------------------
+  # caddy:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/caddy/Dockerfile.prod
+  #   container_name: django_api_caddy_prod
+  #   image: adved85/django-api-caddy-prod
+  #   restart: always
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - static_volume:/app/staticfiles:ro
+  #     - caddy_data:/data
+  #     - caddy_config:/config
+  #   depends_on:
+  #     api:
+  #       condition: service_healthy
+
+  postgres:
+    image: postgres:17
+    container_name: postgres_prod
+    restart: always
+    # Read DB credentials from the same .env.prod the api service uses,
+    # so the values aren't duplicated (and the file is the single source of truth).
+    env_file:
+      - .env.prod
+    environment:
+      POSTGRES_DB: django_db
+      POSTGRES_USER: django_user
+      # POSTGRES_PASSWORD comes from .env.prod via env_file above
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U django_user -d django_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:8-alpine
+    container_name: redis_prod
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  postgres_prod_data:
+  static_volume:
+  # Only needed if you switch to the Caddy alternative above — holds its
+  # certificate storage and internal state between restarts.
+  # caddy_data:
+  # caddy_config:

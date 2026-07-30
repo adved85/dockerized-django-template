@@ -1,0 +1,548 @@
+Django-specific Docker files are located in the docker/django folder.
+Our goal was to create development and production environments, so AI(jpt) combined them into a single project.
+The main branching is centralized in compose.yml files—one for production and one for development.
+
+Here is the structure of our project:
+
+project/
+├── app/                       <- NOT hand-written, generated (see BOOTSTRAP.md)
+│   ├── manage.py
+│   └── config/
+├── requirements/
+│   ├── base.txt
+│   ├── dev.txt
+│   └── prod.txt
+├── docker/
+│   ├── django/
+│   │   ├── Dockerfile.prod
+│   │   ├── Dockerfile.dev
+│   │   ├── settings.overwrite.py   <- source of truth for app/config/settings.py
+│   │   └── settings.default.py     <- reference snapshot of the plain startproject output (generated, not hand-written)
+│   ├── nginx/                      <- reverse proxy + static file server, default in prod
+│   │   ├── Dockerfile.prod
+│   │   └── nginx.conf
+│   └── caddy/                      <- alternative to nginx, commented out in docker-compose.prod.yml
+│       ├── Dockerfile.prod
+│       └── Caddyfile
+├── .env.dev
+├── .env.prod
+├── docker-compose.dev.yml
+└── docker-compose.prod.yml
+
+Note: requirements/ used to live under app/requirements/. It was moved to the
+project root so the Dockerfiles can COPY it in before app/ even exists.
+
+Note: app/config/settings.py is not hand-edited. The tracked override lives
+at docker/django/settings.overwrite.py; app/config/settings.py is generated
+by `django-admin startproject`, then saved as docker/django/settings.default.py
+(a diffable reference of the plain default), then overwritten with
+`cp docker/django/settings.overwrite.py app/config/settings.py`.
+Edit the override template, re-run the copy.
+
+See docs/guide/BOOTSTRAP.md for the full from-scratch command sequence that
+generates everything under app/ via a temporary container, with no local
+Python install.
+
+1. Development Setup
+@@@@@@@@@@@@@@@@@@@@
+
+Dockerfile.dev
+==============
+
+    here you can see we copy both - base.txt and dev.txt to our workdir, but below,
+    in RUN pip command we are using only dev.txt, because it includes the base one.
+
+    Both files are copied from the project-root requirements/ folder
+    (COPY requirements/base.txt . / COPY requirements/dev.txt .), not from
+    inside app/ — this is what lets the image build before app/ exists at all,
+    see docs/guide/BOOTSTRAP.md.
+
+    ENV PYTHONDONTWRITEBYTECODE=1   - prevents Python from writing .pyc files,
+    ENV PYTHONUNBUFFERED=1          - tells Python to output logs immediately without buffering
+
+docker-compose.dev.yml
+======================
+
+    File name has a "dev" postfix.
+
+    Volumes:
+        There are only 2 volumes, for api (django) and postgres services.
+        Here we have excellent situation with two type of data persistence mechanisms in Docker containers.
+
+        api ---         ./app:/app                                  --- Bind mount
+        postgres ---    postgres_dev_data:/var/lib/postgresql/data  --- Named volume
+
+        Bind mount:
+            ./app = a path on your host machine (local files)
+            /app  = the path inside container
+            The purpose is to keep code live syncing for development. You change the code on your host,
+            and it appears in the Django container.
+                api:
+                    volumes:
+                        - ./app:/app   # Host: ./app → Container: /app
+
+        Named Volumes:
+            postgres_dev_data = a name of the volume used by current container/service Docker manages
+            /var/lib/postgresql/data = the path inside the container
+            The goal is to provide persistent data storage that survives container restarts, 
+            without cluttering the project directory with database files.
+
+        Redis does not have a volume.
+        This is because the redis service is typically used as a volatile cache or session store to speed up Django.
+        Data loss in Redis is not critical and can be recovered by retrieving data from the database.
+
+
+        ❓ Does every container use its own volume, when we scale/replicate a container?
+            $ docker compose -f docker-compose.dev.yml up --scale api=5
+        ✳️-No. All replicas touch the same /app of local machine, and it is a problem.
+            That's why on production you should use external services for shared state.
+            Bind mount is only for development with scale=1  
+
+    Dependencies:
+        We can see that api service has 2 dependencies: redis & postgres.
+
+    Environments:
+        Two of our services have  sections related to environment:
+            api service uses env_file: to point which file to use,
+            postgres uses "environment" to describe connection parameters (db, user, password).
+
+    Build:
+        In our API service, the 'build' section specifies that Django is built using a Dockerfile.
+
+    a) I have renamed postgres and redis container names by adding "django_api_" prefix:
+        # container_name: postgres_dev
+        container_name: django_api_postgres_dev
+
+        # container_name: redis_dev
+        container_name: django_api_redis_dev
+
+    b) I have renamed .env to .env.dev to keep consistency with docker-compose name.
+        env_file:
+            # - .env
+            - .env.dev☝️
+
+    c) I have added image (tag) for api service in both compose files.
+        image: adved85/django-api-dev
+        image: adved85/django-api-prod
+
+
+
+.env (.env.dev)
+===============
+DEBUG=1
+    Debug mode is enabled during development.
+
+SECRET_KEY=dev-secret-key
+
+    The SECRET_KEY is a cryptographic signing key that Django uses for security-critical operations. 
+    It's essentially the master key for your Django application.
+
+    For production you should generate cryptographic signing key(SECRET_KEY)
+    There are many ways to generate it (via Python, django-admin, django.core.management.utils)
+    Here is one of them:
+        openssl rand -base64 50
+
+    Same idea for POSTGRES_PASSWORD (openssl rand -base64 32). For the
+    actual command that generates both and writes them straight into
+    .env.prod (not just prints them for you to copy by hand), see
+    docs/guide/BOOTSTRAP.md, section "Step 6 — Production" / Preparation.
+
+POSTGRES_*
+    All this parameters you have seen in docker-compose.dev.yml
+    Plus _HOST & _PORT of database
+        POSTGRES_HOST=postgres
+        POSTGRES_PORT=5432
+
+REDIS_HOST=redis
+REDIS_PORT=6379
+    Here is the Redis host and port to connect to.
+
+3. Requirements
+===============
+In requirements we describe all Python packages/libraries INSTALLED VIA pip (not Docker) needed for our app.
+example of installing them::
+    pip install -r requirements.txt 
+    OR 
+    pip install -r dev.txt // in our case
+    
+    base.txt
+    --------
+        Django>=5.2      # Python web framework
+        psycopg[binary]  # PostgreSQL adapter for Python
+        redis            # Redis client library for Python
+        django-redis     # Proper Django cache backend
+
+
+    dev.txt
+    -------
+        This file extends base.txt and adds development-only Python packages. 
+        The -r base.txt line means "include everything from base.txt first."
+
+        -r base.txt
+
+        ipython                 # An interactive Python shell on steroids
+        django-debug-toolbar    # A configurable panel that displays debugging info right in your browser
+
+
+    prod.txt
+    --------
+        This file extends base.txt and adds production-ready Python packages.
+        The -r base.txt line means "include everything from base.txt first."
+    
+        Both together = Maximum flexibility (gunicorn as process manager, uvicorn for async workers)
+
+        -r base.txt
+
+        gunicorn    # Gunicorn = Standard production server for traditional Django + strong process manager
+        uvicorn     # Uvicorn = Modern async server for Django 3.0+ with async features
+
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+----------------------------------------------------------------------------
+                commands for creating a dev environment
+----------------------------------------------------------------------------
+    ➊-=== ||| so after building dj-env |||===- 
+        $ docker compose -f docker-compose.dev.yml up --build
+        (-f = means use file pointed for the build or run, used with both "docker" & "docker compose")
+
+        without "image" name (section) in docker-compose.dev.yml you will get:
+            "django-app-api" = "django-app" + "api" = root path name + service name
+            "adved85/django-api-dev" is better, that's why I've added "image" section
+             
+
+            (If you don't want to specify the image in the compose file, 
+                but want to give it a name on the host for easy management)
+            (the first command also can be used to rebuild specific services only)
+            ----------------------------------------------------------------------
+            docker compose -f docker-compose.dev.yml build your-service-name (api)
+            docker tag your-service-name:latest adved85/django-api-dev:latest
+            #docker push adved85/django-api-dev:latest
+            or
+            docker compose -f docker-compose.dev.yml build --build-arg IMAGE_TAG=adved85/django-api-dev:latest
+
+
+        you will get an error during running container like this:
+            🧲️ python: can't open file '/app/manage.py': [Errno 2] No such file or directory
+            🧲️ django_api_dev exited with code 2
+
+        because we are running up --build with no project installed
+        to fix that, we have to run this command to install app and create necessary files
+            app/manage.py
+            app/config/settings.py and other config files
+
+    ➋-===||| Initialize Django project |||===-
+        Full from-scratch command sequence (scaffold via a temporary
+        container, snapshot the default settings.py, apply the
+        Postgres+Redis override) lives in docs/guide/BOOTSTRAP.md — that
+        file is the source of truth, don't duplicate the commands here.
+
+        Short version:
+        $ docker run --rm -v "$(pwd)/app:/app" -w /app python:3.13-slim \
+          bash -c "pip install django && django-admin startproject config ."
+        $ docker run --rm -v "$(pwd)/app:/app" python:3.13-slim \
+          chown -R "$(id -u):$(id -g)" /app
+        $ cp app/config/settings.py docker/django/settings.default.py
+        $ cp docker/django/settings.overwrite.py app/config/settings.py
+
+    ➌-===||| migrate |||===-
+        $ docker compose -f docker-compose.dev.yml exec api python manage.py migrate
+
+    ➌-===||| create superuser to login admin panel |||===-
+        $ docker compose -f docker-compose.dev.yml exec api python manage.py createsuperuser
+
+            ---------- superuser data -----------
+            | root | root@gmail.com | secret123 |
+            -------------------------------------
+
+        http://localhost:8008/
+        http://localhost:8008/admin
+
+    Check connection to Redis and DB from shell.
+    (see also docs/guide/redis_usage.txt and docs/guide/database_usage.txt
+    for more cache/DB examples, backups, and resets)
+    ............................................
+         enter to  container shell
+        $ docker compose -f docker-compose.dev.yml exec api sh
+
+         open Django shell (reminder - you have installed also django-debug-toolbar)
+        # python manage.py shell
+
+
+         test redis connection
+        In:[1] from django.core.cache import cache
+        In:[2] cache.set("hello", "world", 30)
+        In:[3] cache.get("hello")
+
+            If you see expected output - you are successfully connected!
+            Out[1]: 'world'
+
+         test database connection
+        still inside Django shell
+        In:[4] from django.db import connection
+        In:[5] connection.ensure_connection()
+
+         output something from database
+        User.objects.all()
+        Out[1]: <QuerySet [<User: root>]>
+        //or more elegant
+        for user in User.objects.all():
+            print(user.username)
+        root
+
+    Direct PostgreSQL access (enter to postgres shell)
+    ..................................................
+        $ docker compose -f docker-compose.dev.yml exec postgres psql -U django_user -d django_db
+        # SELECT * FROM auth_user;
+        (should see table of users)
+        // exit via typing q
+        #q 
+
+
+
+    IN docker/django/ you can find "settings.overwrite.py" which contains
+    all configs for the corresponding DB and cache (this is what actually
+    ends up as app/config/settings.py). "settings.default.py" next to it is
+    just a reference snapshot of the plain sqlite/no-cache settings.py that
+    `django-admin startproject` generates on its own — see BOOTSTRAP.md.
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+2. Now about Production Setup
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+Production should use:
+
+    gunicorn
+    non-root user
+    multi-stage build
+    no bind mounts
+    static collection
+    restart policy
+    reverse proxy in front of gunicorn (nginx by default, Caddy as a
+        commented-out alternative — see docs/guide/BOOTSTRAP.md, section
+        "Reverse proxy: nginx vs Caddy")
+
+Only "api" publishes a container port directly to the host before this;
+now nginx is the only one that does — api, postgres, and redis are all
+internal-network-only in docker-compose.prod.yml.
+
+Dockerfile.prod
+===============
+    I have renamed Dockerfile to Dockerfile.prod to be consistent.
+    So docker-compose.prod.yml references Dockerfile.prod when building the "api" service.
+
+    Dockerfile.prod is multi-stage and has "build stage" and "runtime stage"
+
+    ### building
+    WORKDIR /install                                    # building workdir is install
+    ...
+    RUN pip install --prefix=/install/deps -r prod.txt  #--prefix points where to place base-prod-dependencies
+
+    ### running
+    WORKDIR /app                # running workdir is "app" again
+
+    ### specific copy
+    COPY --from=builder /install/deps /usr/local
+
+        /usr/local/
+                ├── bin/           # Copied from /install/deps/bin
+                ├── lib/           # Copied from /install/deps/lib
+                └── share/         # Copied from /install/deps/share
+
+            /usr/local/bin/                             ---> for gunicorn, uvicorn
+            /usr/local/lib/python3.13/site-packages/    ---> Python packages (like node_packages)
+
+        # copies all from the "/install/deps" (defined via --prefix) in the "builder" stage
+        # to the "usr/local" in the final, "runtime" stage
+
+
+    ### cleaner, recommended approach
+    # because usr/local can already contain some data - it may lead to file conflicts and overwriting.
+    ### Option 1: Copy to a dedicated directory (Recommended)
+    
+    COPY --from=builder /install/deps /opt/deps
+    ENV PYTHONPATH=/opt/deps/lib/python3.13/site-packages
+    ENV PATH="/opt/deps/bin:$PATH"
+
+    Then,
+        we are making "djangouser"
+        copy app to container
+        granting owner privileges to djangouser
+        expose a TCP port to run this app
+        command to start gunicorn with the specified number of worker processes
+
+    Let's test our Dockerfile.prod
+
+
+
+
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+------------------------------------------------------------------------------------
+                    commands to build production environment
+------------------------------------------------------------------------------------
+
+$ docker compose -f docker-compose.prod.yml up --build -d
+
+    App is now at http://localhost/ (port 80, via nginx) — not :8000.
+    gunicorn/api no longer publishes a host port at all; nginx is the only
+    entry point. See docs/guide/BOOTSTRAP.md, section "Reverse proxy: nginx
+    vs Caddy", for preparation/installation/checking steps in full, plus
+    how to switch to the Caddy alternative.
+
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+            production setup — what was corrected and why
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+
+    The first version of the production configuration was functionally close,
+    but contained a few real problems. The fixed-up files are:
+
+        - .env.prod                 (strong secrets, comments)
+        - docker/django/Dockerfile.prod   (HEALTHCHECK + cleaner CMD)
+        - docker-compose.prod.yml    (healthchecks + service_healthy gates + static volume)
+        - docs/guide/overview.txt    (this section)
+
+    ------------------------------------------------------------
+    1) .env.prod — secret strength
+    ------------------------------------------------------------
+        ❌ Before:
+            SECRET_KEY=super-production-secret-key
+            POSTGRES_PASSWORD=strong_password_here
+            ALLOWED_HOSTS=your-domain.com
+        These are placeholders. Using them in a real deployment is a critical
+        security failure: a known SECRET_KEY allows attackers to forge
+        sessions, password-reset tokens, etc.
+
+        ✅ After:
+            SECRET_KEY=<generated with `openssl rand -base64 50`>
+            POSTGRES_PASSWORD=<generated with `openssl rand -base64 32`>
+            ALLOWED_HOSTS=your-domain.com,www.your-domain.com
+        The file now has comments reminding you to replace the values
+        before going live. Re-run `openssl rand -base64 50` to rotate.
+
+        Since this repo is a GitHub template repository, the committed
+        .env.prod deliberately went one step further: instead of
+        real-looking generated values (which every "Use this template"
+        click would copy verbatim into a new repo, and someone would
+        eventually forget to rotate), it ships obviously-fake placeholders
+        — SECRET_KEY=CHANGE-ME-run-openssl-rand--base64-50, same idea for
+        POSTGRES_PASSWORD. The generate-and-write-in-place command (not
+        just "run this and copy the output by hand") is in
+        docs/guide/BOOTSTRAP.md, Step 6 / Preparation.
+
+    ------------------------------------------------------------
+    2) docker-compose.prod.yml — startup race condition
+    ------------------------------------------------------------
+        ❌ Before:
+            depends_on:
+              - postgres
+              - redis
+        Plain `depends_on` only waits for the containers to *start*, not
+        for the services inside to be *ready*. On the very first boot
+        `python manage.py migrate` would fail with:
+            django.db.utils.OperationalError: could not connect to server:
+            Connection refused
+            Is the server running on host "postgres" (172.x.x.x) ...
+
+        ✅ After:
+            Each backing service has a `healthcheck:` and the api service
+            waits on it via `condition: service_healthy`:
+              postgres -> `pg_isready -U django_user -d django_db`
+              redis    -> `redis-cli ping`
+            Now `migrate` / `collectstatic` only run after Postgres and
+            Redis are confirmed healthy. The api also has its own
+            healthcheck (HTTP GET on /) for orchestration tools.
+
+        Extra fixes:
+          - `static_volume:/app/staticfiles` is added so the
+            `collectstatic` output survives container rebuilds.
+          - `POSTGRES_PASSWORD` is interpolated from `.env.prod` via
+            `${POSTGRES_PASSWORD:?...}`, so a missing value fails fast
+            instead of starting Postgres with an empty password.
+          - gunicorn now streams access + error logs to stdout/stderr
+            (`--access-logfile - --error-logfile -`) so `docker logs`
+            shows them.
+
+    ------------------------------------------------------------
+    3) docker/django/Dockerfile.prod — observability
+    ------------------------------------------------------------
+        ❌ Before:
+            No HEALTHCHECK. The image is "alive" from Docker's point of
+            view the instant gunicorn is forked, even if the app is
+            actually broken (e.g. DB unreachable, import error).
+
+        ✅ After:
+            HEALTHCHECK --interval=30s --timeout=10s --start-period=20s \
+              --retries=3 \
+              CMD python -c "import urllib.request; \
+                urllib.request.urlopen('http://localhost:8000/admin/login/', timeout=3)" \
+              || exit 1
+        Uses Python's stdlib (the slim image has no curl/wget) and
+        gives the app a 20s grace period to start.
+
+        The default `CMD` is also clarified with a comment explaining
+        that docker-compose.prod.yml overrides it with
+        `migrate + collectstatic + gunicorn`.
+
+    ------------------------------------------------------------
+    4) settings.py — out of scope here
+    ------------------------------------------------------------
+        The base `app/config/settings.py` is shared between dev and
+        prod, and is generated from `docker/django/settings.overwrite.py`
+        (see BOOTSTRAP.md) — not hand-edited under app/. For a real
+        production deployment you would typically:
+          * set SECURE_PROXY_SSL_HEADER, SECURE_SSL_REDIRECT,
+            SESSION_COOKIE_SECURE, CSRF_COOKIE_SECURE,
+            SECURE_HSTS_SECONDS, SECURE_CONTENT_TYPE_NOSNIFF, etc.
+          * add a `LOGGING` config so gunicorn errors go to stderr
+            (or to a file/volume).
+          * consider splitting prod-specific overrides into their own
+            settings module (e.g. docker/django/settings.prod_overwrite.py)
+            and selecting it via DJANGO_SETTINGS_MODULE.
+        These changes are deliberately NOT made here because they
+        belong to a broader hardening pass.
+
+    ------------------------------------------------------------
+    5) nginx reverse proxy added, plus 3 bugs it exposed
+    ------------------------------------------------------------
+        Adding docker/nginx/ (serves /static/ directly, proxies everything
+        else to api, made nginx the only service with a published host
+        port) meant something finally depended on the api container's
+        healthcheck (`condition: service_healthy`) actually passing. It
+        never had before, for three separate, pre-existing reasons — all
+        fixed while wiring nginx in:
+
+        a) The api healthcheck's `test:` in docker-compose.prod.yml had
+           `|| exit 1` written *inside* the python -c string:
+               python -c "...urlopen(...) || exit 1"
+           `||` isn't a Python operator — this was a permanent SyntaxError,
+           so the healthcheck could never pass. `|| exit 1` isn't needed at
+           all here: urlopen() already raises on failure, which already
+           makes `python -c` exit non-zero.
+
+        b) Both the Dockerfile.prod HEALTHCHECK and the compose-level one
+           targeted `GET /`. This project's urls.py only registers
+           `admin/` — `/` is a guaranteed 404, and urlopen()/wget both
+           treat any 4xx as a failure. Retargeted to `/admin/login/`,
+           which exists as long as django.contrib.admin stays installed.
+
+        c) With ALLOWED_HOSTS set to a real domain (no "localhost"), the
+           container's own healthcheck request — Host: localhost — got a
+           400 DisallowedHost from Django itself. .env.prod now keeps
+           "localhost" and "127.0.0.1" in ALLOWED_HOSTS permanently
+           (needed by nginx's own healthcheck too, which hits
+           127.0.0.1 — see docker/nginx/Dockerfile.prod's comment on why
+           not "localhost": it resolves to ::1 in that image, and
+           nginx.conf only listens on IPv4).
+
+        Separately, `collectstatic` was failing with PermissionError on
+        `/app/staticfiles` the first time the prod stack was actually run
+        end-to-end: Dockerfile.prod switches to a non-root `djangouser`,
+        but the `static_volume` named volume mounts onto a path that
+        didn't yet exist in the image, so Docker created it root-owned.
+        Fixed by `mkdir -p /app/staticfiles && chown ... djangouser` before
+        `USER djangouser` — Docker seeds a new named volume from whatever
+        already exists (incl. ownership) at the image's mount point.
+
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@

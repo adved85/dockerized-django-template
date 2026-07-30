@@ -1,0 +1,44 @@
+How PostgreSQL is Used
+
+Example (Django ORM):
+
+from django.contrib.auth.models import User
+
+User.objects.create_user("alice", "alice@example.com", "secret123")
+
+for user in User.objects.all():
+    print(user.username)
+
+
+Connect via psql (dev):
+
+$ docker compose -f docker-compose.dev.yml exec postgres psql -U django_user -d django_db
+
+    \dt              list tables
+    \d auth_user     describe a table
+    SELECT * FROM auth_user;
+    \q               quit
+
+
+Backup / restore (dev, adjust for prod's postgres_prod_data volume):
+
+$ docker compose -f docker-compose.dev.yml exec postgres pg_dump -U django_user django_db > backup.sql
+$ cat backup.sql | docker compose -f docker-compose.dev.yml exec -T postgres psql -U django_user -d django_db
+
+
+Reset the dev database (⚠️ destroys all data in the named volume):
+
+$ docker compose -f docker-compose.dev.yml down
+$ docker volume rm django-app_postgres_dev_data
+$ docker compose -f docker-compose.dev.yml up -d
+
+
+Migrations workflow:
+
+$ docker compose -f docker-compose.dev.yml exec api python manage.py makemigrations
+$ docker compose -f docker-compose.dev.yml exec api python manage.py migrate
+$ docker compose -f docker-compose.dev.yml exec api python manage.py showmigrations
+
+
+docs/guide/overview.txt:    Direct PostgreSQL access (enter to postgres shell)
+..................................................................................
